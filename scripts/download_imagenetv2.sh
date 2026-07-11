@@ -97,7 +97,21 @@ fi
 rm -rf "${TMP_EXTRACT}"
 mkdir -p "${TMP_EXTRACT}"
 echo "Extracting..."
-tar -xzf "${ARCHIVE}" -C "${TMP_EXTRACT}"
+# The official file is named .tar.gz, but some mirrors may serve it as a
+# plain tar archive. Try gzip first, then fall back to regular tar.
+if gzip -t "${ARCHIVE}" >/dev/null 2>&1; then
+  tar -xzf "${ARCHIVE}" -C "${TMP_EXTRACT}"
+else
+  echo "Archive is not gzip-compressed; trying plain tar extraction..."
+  if ! tar -xf "${ARCHIVE}" -C "${TMP_EXTRACT}"; then
+    echo "Extraction failed. File type:" >&2
+    file "${ARCHIVE}" >&2 || true
+    echo "If this says HTML/text, delete the archive and retry with another URL:" >&2
+    echo "  rm -f ${ARCHIVE}" >&2
+    echo "  bash scripts/download_imagenetv2.sh ${DATA_ROOT} --url https://.../imagenetv2-matched-frequency.tar.gz" >&2
+    exit 1
+  fi
+fi
 
 # Normalize extracted folder name to what data/datautils.py expects.
 FOUND=""
