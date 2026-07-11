@@ -392,6 +392,23 @@ class ClipTestTimeTuning(nn.Module):
 
         return logits
 
+    def inference_with_features(self, image):
+        """Return logits and frozen normalized image features for SAR filtering.
+
+        The image encoder remains frozen/no-grad exactly as in ``inference``;
+        logits still depend on the current learnable text prompt, so SAR loss can
+        backpropagate to prompt parameters.
+        """
+
+        with torch.no_grad():
+            image_features = self.image_encoder(image.type(self.dtype))
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+
+        text_features = self.get_text_features()
+        logit_scale = self.logit_scale.exp()
+        logits = logit_scale * image_features @ text_features.t()
+        return logits, image_features
+
     def forward(self, input):
         if isinstance(input, Tuple):
             view_0, view_1, view_2 = input

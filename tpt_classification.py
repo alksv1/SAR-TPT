@@ -28,6 +28,7 @@ from clip.cocoop import get_cocoop
 from data.sar_augment import SARAugMixAugmenter
 from data.imagnet_prompts import imagenet_classes
 from data.datautils import AugMixAugmenter, build_dataset
+from utils.sar_filter import sar_filter_and_loss
 from utils.semantic_region import SemanticRegionLocator
 from utils.text_anchors import load_text_anchor_file
 from utils.tools import Summary, AverageMeter, ProgressMeter, accuracy, load_model_weight, set_random_seed
@@ -71,19 +72,46 @@ def test_time_tuning(model, inputs, optimizer, scaler, args):
         optimizer = torch.optim.AdamW([pgen_ctx], args.lr)
     
     selected_idx = None
+    sar_filter_result = None
     for j in range(args.tta_steps):
         with torch.cuda.amp.autocast():
             if args.cocoop:
                 output = model((image_feature, pgen_ctx))
+            elif args.sar_tpt and getattr(args, "current_anchor_payload", None) is not None:
+                output, image_features = model.inference_with_features(inputs)
             else:
                 output = model(inputs) 
 
-            if selected_idx is not None:
-                output = output[selected_idx]
+            if args.sar_tpt and getattr(args, "current_anchor_payload", None) is not None and not args.disable_sar_filter:
+                anchors = args.current_anchor_payload["anchors"].to(output.device)
+                if selected_idx is not None:
+                    output = output[selected_idx]
+                    image_features = image_features[selected_idx]
+                else:
+                    loss, sar_filter_result = sar_filter_and_loss(
+                        logits=output,
+                        image_features=image_features,
+                        anchors=anchors,
+                        target_idx=None,
+                        logit_scale=model.logit_scale.exp(),
+                        lambda_anchor=args.lambda_anchor,
+                        entropy_scale=args.entropy_scale,
+                        reliable_ratio=args.reliable_ratio,
+                        reliable_top_k=args.reliable_top_k,
+                        min_reliable_views=args.min_reliable_views,
+                        disable_anchor_filter=args.disable_anchor_filter,
+                        disable_entropy_filter=args.disable_entropy_filter,
+                    )
+                    selected_idx = sar_filter_result.reliable_idx
+                    output = sar_filter_result.reliable_logits
+                if selected_idx is not None and j > 0:
+                    loss = avg_entropy(output)
             else:
-                output, selected_idx = select_confident_samples(output, args.selection_p)
-
-            loss = avg_entropy(output)
+                if selected_idx is not None:
+                    output = output[selected_idx]
+                else:
+                    output, selected_idx = select_confident_samples(output, args.selection_p)
+                loss = avg_entropy(output)
         
         optimizer.zero_grad()
         # compute gradient and do SGD step
@@ -94,6 +122,8 @@ def test_time_tuning(model, inputs, optimizer, scaler, args):
     if args.cocoop:
         return pgen_ctx
 
+    if sar_filter_result is not None:
+        args.last_sar_filter_debug = sar_filter_result.as_debug_dict()
     return
 
 
@@ -104,7 +134,7 @@ def main():
             print("=> --sar_tpt implies --tpt; enabling test-time prompt tuning.")
             args.tpt = True
         if args.cocoop:
-            raise NotImplementedError("Stage-three SAR region-guided augmentation currently supports the CoOp/TPT branch, not CoCoOp.")
+            raise NotImplementedError("SAR-TPT currently supports the CoOp/TPT branch, not CoCoOp.")
     set_random_seed(args.seed)
 
     # This codebase has only been tested under the single GPU setting
@@ -225,6 +255,7 @@ def main_worker(gpu, args):
                         "Anchor classnames do not match current evaluation class order for {}. "
                         "Rebuild anchors with the same dataset id/class order.".format(set_id)
                     )
+                args.current_anchor_payload = anchor_payload
                 semantic_locator = SemanticRegionLocator(
                     anchor_payload,
                     mask_top_ratio=args.mask_top_ratio,
@@ -251,10 +282,12 @@ def main_worker(gpu, args):
                 )
                 print("=> Using SAR region-guided augmentation with anchors: {}".format(anchor_path))
             else:
+                args.current_anchor_payload = None
                 data_transform = AugMixAugmenter(base_transform, preprocess, n_views=args.batch_size-1,
                                                 augmix=len(set_id)>1)
             batchsize = 1
         else:
+            args.current_anchor_payload = None
             data_transform = transforms.Compose([
                 transforms.Resize(args.resolution, interpolation=BICUBIC),
                 transforms.CenterCrop(args.resolution),
@@ -276,6 +309,8 @@ def main_worker(gpu, args):
         results[set_id] = test_time_adapt_eval(val_loader, model, model_state, optimizer, optim_state, scaler, args)
         if args.sar_tpt and hasattr(data_transform, "stats"):
             print("=> SAR augmentation stats [{}]: {}".format(set_id, data_transform.stats.as_dict()))
+            if getattr(args, "last_sar_filter_debug", None) is not None:
+                print("=> SAR filter last debug [{}]: {}".format(set_id, args.last_sar_filter_debug))
         del val_dataset, val_loader
         try:
             print("=> Acc. on testset [{}]: @1 {}/ @5 {}".format(set_id, results[set_id][0], results[set_id][1]))
@@ -424,5 +459,21 @@ if __name__ == '__main__':
                         help='padding ratio for semantic-mask bounding-box fallback')
     parser.add_argument('--augmix_severity', default=1, type=int,
                         help='AugMix severity for SAR guided views')
+    parser.add_argument('--lambda_anchor', default=0.5, type=float,
+                        help='stage-four score weight for anchor similarity')
+    parser.add_argument('--entropy_scale', default=1.0, type=float,
+                        help='stage-four entropy score scale')
+    parser.add_argument('--reliable_ratio', default=0.5, type=float,
+                        help='stage-four ratio of reliable views to keep')
+    parser.add_argument('--reliable_top_k', default=None, type=int,
+                        help='stage-four fixed number of reliable views to keep; overrides reliable_ratio when > 0')
+    parser.add_argument('--min_reliable_views', default=1, type=int,
+                        help='minimum reliable views kept by SAR filter')
+    parser.add_argument('--disable_sar_filter', action='store_true', default=False,
+                        help='ablation: use SAR guided crops but original entropy filtering')
+    parser.add_argument('--disable_anchor_filter', action='store_true', default=False,
+                        help='ablation: remove anchor similarity from SAR filtering')
+    parser.add_argument('--disable_entropy_filter', action='store_true', default=False,
+                        help='ablation: remove prediction entropy from SAR filtering')
 
     main()

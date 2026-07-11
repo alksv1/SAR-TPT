@@ -160,3 +160,53 @@
 - 新增 `tests/test_stage3_sar_augment.py` 做纯工具测试。
 
 下一阶段应实现双模态一致性过滤与 SAR loss，将阶段一 anchors 和阶段二 target anchor 用于视图可靠性筛选。
+
+## 10. 第四阶段交付状态与项目闭环
+
+第四阶段已完成：
+
+- 新增 `utils/sar_filter.py`，实现双模态一致性过滤与 SAR loss；
+- `clip/custom_clip.py` 新增 `inference_with_features()`，用于同时返回 logits 和冻结 image features；
+- `tpt_classification.py` 的 `test_time_tuning()` 已接入 SAR loss；
+- 新增 `scripts/validate_sar_filter.py` 和 `tests/test_stage4_sar_filter.py`。
+
+当前项目已具备完整 SAR-TPT 流水线：
+
+1. `scripts/build_text_anchors.py` 生成/编码强文本锚点；
+2. `utils/semantic_region.py` 基于 ViT spatial tokens 生成 semantic mask；
+3. `data/sar_augment.py` 根据 mask 生成区域引导多视图；
+4. `utils/sar_filter.py` 对多视图执行双模态过滤并计算 SAR loss；
+5. `tpt_classification.py --sar_tpt` 串联完整流程。
+
+推荐验收顺序：
+
+```bash
+python -m unittest tests/test_stage1_text_anchors.py
+python -m unittest tests/test_stage2_semantic_region.py
+python -m unittest tests/test_stage3_sar_augment.py
+python -m unittest tests/test_stage4_sar_filter.py
+```
+
+完整实验前需要先生成对应数据集和架构的 anchors：
+
+```bash
+python scripts/build_text_anchors.py \
+  --dataset Pets \
+  --arch ViT-B/16 \
+  --llm-generate \
+  --description-path assets/anchors/descriptions/Pets.json \
+  --output assets/anchors/features/Pets_ViT-B-16.pt
+```
+
+然后运行：
+
+```bash
+python tpt_classification.py /path/to/data \
+  --test_sets Pets \
+  -a ViT-B/16 \
+  -b 64 \
+  --gpu 0 \
+  --tpt \
+  --sar_tpt \
+  --anchor_path assets/anchors/features/Pets_ViT-B-16.pt
+```
