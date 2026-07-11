@@ -297,6 +297,79 @@ class ClipTestTimeTuning(nn.Module):
     def reset_classnames(self, classnames, arch):
         self.prompt_learner.reset_classnames(classnames, arch)
 
+    def encode_image_features(self, image, normalize=True):
+        """Encode image features without changing prompt state.
+
+        Args:
+            image: CLIP-normalized image tensor.
+            normalize: Whether to L2-normalize returned global features.
+
+        Returns:
+            Tensor shaped ``[B, D]`` in the shared CLIP embedding space.
+        """
+
+        image_features = self.image_encoder(image.type(self.dtype))
+        if normalize:
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        return image_features
+
+    def encode_image_with_spatial_tokens(self, image, normalize=True):
+        """Return global and patch-level ViT image features.
+
+        This is the stage-two SAR-TPT hook. It mirrors ``VisionTransformer``'s
+        forward pass but keeps all patch tokens after the transformer, applies
+        the same ``ln_post`` and projection as the class token, and returns them
+        in the CLIP text embedding space.
+
+        Returns:
+            ``(cls_feature, spatial_tokens, grid_size)`` where:
+            - ``cls_feature`` is ``[B, D]``;
+            - ``spatial_tokens`` is ``[B, M, D]``;
+            - ``grid_size`` is ``(Gh, Gw)``.
+
+        Raises:
+            NotImplementedError: for non-ViT visual backbones such as RN50.
+        """
+
+        visual = self.image_encoder
+        required = ["class_embedding", "positional_embedding", "ln_pre", "transformer", "ln_post", "proj"]
+        if not all(hasattr(visual, name) for name in required):
+            raise NotImplementedError(
+                "SAR-TPT semantic region localization currently requires a CLIP ViT visual encoder."
+            )
+
+        x = image.type(self.dtype)
+        x = visual.conv1(x)  # [B, width, Gh, Gw]
+        grid_size = (int(x.shape[-2]), int(x.shape[-1]))
+        x = x.reshape(x.shape[0], x.shape[1], -1)
+        x = x.permute(0, 2, 1)  # [B, M, width]
+        cls = visual.class_embedding.to(x.dtype)
+        cls = cls + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device)
+        x = torch.cat([cls, x], dim=1)
+
+        if x.shape[1] != visual.positional_embedding.shape[0]:
+            raise ValueError(
+                "Input resolution produced a patch grid incompatible with the CLIP positional embedding: "
+                f"tokens={x.shape[1]}, positional={visual.positional_embedding.shape[0]}"
+            )
+
+        x = x + visual.positional_embedding.to(x.dtype)
+        x = visual.ln_pre(x)
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        x = visual.transformer(x)
+        x = x.permute(1, 0, 2)  # LND -> NLD
+        x = visual.ln_post(x)
+
+        if visual.proj is not None:
+            x = x @ visual.proj
+
+        cls_feature = x[:, 0, :]
+        spatial_tokens = x[:, 1:, :]
+        if normalize:
+            cls_feature = cls_feature / cls_feature.norm(dim=-1, keepdim=True)
+            spatial_tokens = spatial_tokens / spatial_tokens.norm(dim=-1, keepdim=True)
+        return cls_feature, spatial_tokens, grid_size
+
     def get_text_features(self):
         text_features = []
         prompts = self.prompt_learner()
@@ -344,4 +417,3 @@ def get_coop(clip_arch, test_set, device, n_ctx, ctx_init, learned_cls=False):
                             n_ctx=n_ctx, ctx_init=ctx_init, learned_cls=learned_cls)
 
     return model
-
