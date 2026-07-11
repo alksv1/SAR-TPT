@@ -149,3 +149,14 @@
 - `tests/test_stage2_semantic_region.py` 已提供无需 CLIP 权重的工具测试。
 
 下一阶段应在 `data/sar_augment.py` 中接入 `SemanticRegionLocator` 的 `mask` 输出，实现区域引导裁剪。
+
+## 9. 第三阶段交付状态
+
+第三阶段已完成区域引导多视图增强：
+
+- 新增 `data/sar_augment.py`，实现 semantic mask coverage 约束裁剪；
+- `tpt_classification.py` 已支持 `--sar_tpt` 和阶段三裁剪参数；
+- 新增 `scripts/validate_sar_augment.py` 做不依赖 CLIP 的增强器验收；
+- 新增 `tests/test_stage3_sar_augment.py` 做纯工具测试。
+
+下一阶段应实现双模态一致性过滤与 SAR loss，将阶段一 anchors 和阶段二 target anchor 用于视图可靠性筛选。

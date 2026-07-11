@@ -149,3 +149,130 @@ views = augmenter(pil_image)
 3. 回退不会导致程序中断。
 4. 禁用 SAR 参数时，原始 TPT 实验可正常运行。
 5. 可记录并打印 coverage、重采样次数等调试统计。
+
+## 9. 第三阶段实现与验收记录
+
+本阶段已完成区域引导的约束多视图增强，并保持与原始 TPT 多视图输出格式兼容。
+
+### 9.1 交付文件
+
+- `data/sar_augment.py`
+  - `SARAugMixAugmenter`：SAR-TPT 区域引导多视图增强器；
+  - `select_guided_crop_box()`：根据 semantic mask 重采样候选 crop box；
+  - `crop_coverage()`：计算候选框对 semantic mask 的覆盖率；
+  - `mask_bounding_box()` / `expand_box()`：fallback 到语义掩码外接框；
+  - `SARAugmentStats`：统计平均 coverage、重采样次数、fallback 次数；
+  - 输出格式保持 `[clean_tensor, guided_view_1, ..., guided_view_N]`。
+
+- `tpt_classification.py`
+  - 新增 `--sar_tpt` 可选路径；
+  - 新增 `--anchor_path` 载入阶段一 anchors；
+  - 新增阶段三相关参数：`--tau_cov`、`--max_crop_trials`、`--crop_scale_min/max`、`--crop_ratio_min/max`、`--hflip_p`、`--bbox_padding_ratio`；
+  - `--sar_tpt` 会自动启用 `--tpt`；
+  - 因 transform 中需要持有模型做定位，SAR 路径会将 DataLoader workers 覆盖为 `0`，避免多进程复制 CUDA 模型。
+
+- `tests/test_stage3_sar_augment.py`
+  - 不加载 CLIP、不依赖真实数据；
+  - 测试 coverage 计算、bbox fallback、输出格式、mask resize。
+
+- `scripts/validate_sar_augment.py`
+  - 使用单张图片和 synthetic/provided mask 验证增强器输出与 crop 统计；
+  - 不需要 CLIP。
+
+### 9.2 核心接口
+
+单独使用增强器：
+
+```python
+from data.sar_augment import SARAugMixAugmenter
+
+augmenter = SARAugMixAugmenter(
+    base_transform=base_transform,
+    preprocess=preprocess,
+    n_views=batch_size - 1,
+    semantic_locator=semantic_locator,
+    model=model,
+    device=device,
+    tau_cov=0.6,
+    max_crop_trials=20,
+    output_size=224,
+)
+
+views = augmenter(pil_image)
+```
+
+输出：
+
+```python
+[clean_image, guided_view_1, guided_view_2, ...]
+```
+
+与原始 `AugMixAugmenter` 一致，因此后续仍可执行：
+
+```python
+images = torch.cat(images, dim=0)
+```
+
+### 9.3 坐标系说明
+
+为保证 mask 与 crop 坐标一致，当前实现采用：
+
+1. 先对原始 PIL 图像执行 `base_transform`，得到 clean/base PIL 图像；
+2. 阶段二 `SemanticRegionLocator` 在该 clean/base 图像的 tensor 上定位；
+3. 阶段三所有 guided crop 都在同一个 clean/base PIL 图像坐标系中采样；
+4. coverage 也在同尺寸 mask 上计算。
+
+因此不会混用原图坐标和 CLIP 输入坐标。
+
+### 9.4 主评估脚本使用方式
+
+在已完成阶段一 anchors 的环境中运行：
+
+```bash
+python tpt_classification.py /path/to/data \
+  --test_sets Pets \
+  -a ViT-B/16 \
+  -b 64 \
+  --gpu 0 \
+  --tpt \
+  --sar_tpt \
+  --anchor_path assets/anchors/features/Pets_ViT-B-16.pt \
+  --tau_cov 0.6 \
+  --max_crop_trials 20
+```
+
+多数据集时，`--anchor_path` 支持模板：
+
+```bash
+--anchor_path 'assets/anchors/features/{set_id}_ViT-B-16.pt'
+```
+
+其中 `{arch}` 会被替换为文件名安全形式，例如 `ViT-B-16`。
+
+### 9.5 阶段三独立验收
+
+不依赖 CLIP 的单图增强验收：
+
+```bash
+python scripts/validate_sar_augment.py \
+  --image /path/to/sample.jpg \
+  --resolution 224 \
+  --n-views 4 \
+  --tau-cov 0.6
+```
+
+纯工具测试：
+
+```bash
+python -m unittest tests/test_stage3_sar_augment.py
+```
+
+### 9.6 验收标准对应关系
+
+- 区域引导候选裁剪：`select_guided_crop_box()` 按 coverage 接受/拒绝；
+- 最大尝试次数与回退：`max_crop_trials` + mask bbox / best effort / center fallback；
+- 增强视图多样性：保留随机尺度、长宽比、水平翻转、可选 AugMix；
+- 与原 AugMixAugmenter 接口兼容：`SARAugMixAugmenter.__call__()` 返回同格式 list；
+- 原图视图稳定：第一个元素仍为 clean/base view；
+- 坐标一致性：定位、mask、crop 均在 base PIL 图像坐标系中完成；
+- 可观测性：`SARAugmentStats` 和 `last_crop_infos` 提供 coverage、trials、fallback 统计。

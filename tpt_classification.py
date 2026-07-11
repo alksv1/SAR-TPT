@@ -25,8 +25,11 @@ import torchvision.models as models
 
 from clip.custom_clip import get_coop
 from clip.cocoop import get_cocoop
+from data.sar_augment import SARAugMixAugmenter
 from data.imagnet_prompts import imagenet_classes
 from data.datautils import AugMixAugmenter, build_dataset
+from utils.semantic_region import SemanticRegionLocator
+from utils.text_anchors import load_text_anchor_file
 from utils.tools import Summary, AverageMeter, ProgressMeter, accuracy, load_model_weight, set_random_seed
 from data.cls_to_names import *
 from data.fewshot_datasets import fewshot_datasets
@@ -36,6 +39,16 @@ from data.imagenet_variants import thousand_k_to_200, imagenet_a_mask, imagenet_
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(models.__dict__[name]))
+
+
+def safe_arch_name(arch):
+    return arch.replace("/", "-").replace("@", "_").replace(" ", "")
+
+
+def resolve_anchor_path(anchor_path, set_id, arch):
+    if anchor_path is None:
+        return None
+    return anchor_path.format(set_id=set_id, dataset=set_id, arch=safe_arch_name(arch))
 
 
 def select_confident_samples(logits, top):
@@ -86,6 +99,12 @@ def test_time_tuning(model, inputs, optimizer, scaler, args):
 
 def main():
     args = parser.parse_args()
+    if args.sar_tpt:
+        if not args.tpt:
+            print("=> --sar_tpt implies --tpt; enabling test-time prompt tuning.")
+            args.tpt = True
+        if args.cocoop:
+            raise NotImplementedError("Stage-three SAR region-guided augmentation currently supports the CoOp/TPT branch, not CoCoOp.")
     set_random_seed(args.seed)
 
     # This codebase has only been tested under the single GPU setting
@@ -161,25 +180,6 @@ def main_worker(gpu, args):
     datasets = args.test_sets.split("/")
     results = {}
     for set_id in datasets:
-        if args.tpt:
-            base_transform = transforms.Compose([
-                transforms.Resize(args.resolution, interpolation=BICUBIC),
-                transforms.CenterCrop(args.resolution)])
-            preprocess = transforms.Compose([
-                transforms.ToTensor(),
-                normalize])
-            data_transform = AugMixAugmenter(base_transform, preprocess, n_views=args.batch_size-1, 
-                                            augmix=len(set_id)>1)
-            batchsize = 1
-        else:
-            data_transform = transforms.Compose([
-                transforms.Resize(args.resolution, interpolation=BICUBIC),
-                transforms.CenterCrop(args.resolution),
-                transforms.ToTensor(),
-                normalize,
-            ])
-            batchsize = args.batch_size
-
         print("evaluating: {}".format(set_id))
         # reset the model
         # Reset classnames of custom CLIP model
@@ -208,14 +208,74 @@ def main_worker(gpu, args):
         else:
             model.reset_classnames(classnames, args.arch)
 
+        if args.tpt:
+            base_transform = transforms.Compose([
+                transforms.Resize(args.resolution, interpolation=BICUBIC),
+                transforms.CenterCrop(args.resolution)])
+            preprocess = transforms.Compose([
+                transforms.ToTensor(),
+                normalize])
+            if args.sar_tpt:
+                anchor_path = resolve_anchor_path(args.anchor_path, set_id, args.arch)
+                if anchor_path is None:
+                    raise ValueError("--sar_tpt requires --anchor_path for stage-three guided augmentation")
+                anchor_payload = load_text_anchor_file(anchor_path, map_location='cpu')
+                if list(anchor_payload["classnames"]) != list(classnames):
+                    raise ValueError(
+                        "Anchor classnames do not match current evaluation class order for {}. "
+                        "Rebuild anchors with the same dataset id/class order.".format(set_id)
+                    )
+                semantic_locator = SemanticRegionLocator(
+                    anchor_payload,
+                    mask_top_ratio=args.mask_top_ratio,
+                    min_mask_area_ratio=args.min_mask_area_ratio,
+                    fallback=args.mask_fallback,
+                    allow_non_vit_fallback=args.allow_non_vit_fallback,
+                )
+                data_transform = SARAugMixAugmenter(
+                    base_transform,
+                    preprocess,
+                    n_views=args.batch_size-1,
+                    augmix=len(set_id)>1,
+                    severity=args.augmix_severity,
+                    semantic_locator=semantic_locator,
+                    model=model,
+                    device=torch.device("cuda:{}".format(args.gpu)) if torch.cuda.is_available() else torch.device("cpu"),
+                    tau_cov=args.tau_cov,
+                    max_crop_trials=args.max_crop_trials,
+                    crop_scale=(args.crop_scale_min, args.crop_scale_max),
+                    crop_ratio=(args.crop_ratio_min, args.crop_ratio_max),
+                    hflip_p=args.hflip_p,
+                    output_size=args.resolution,
+                    bbox_padding_ratio=args.bbox_padding_ratio,
+                )
+                print("=> Using SAR region-guided augmentation with anchors: {}".format(anchor_path))
+            else:
+                data_transform = AugMixAugmenter(base_transform, preprocess, n_views=args.batch_size-1,
+                                                augmix=len(set_id)>1)
+            batchsize = 1
+        else:
+            data_transform = transforms.Compose([
+                transforms.Resize(args.resolution, interpolation=BICUBIC),
+                transforms.CenterCrop(args.resolution),
+                transforms.ToTensor(),
+                normalize,
+            ])
+            batchsize = args.batch_size
+
         val_dataset = build_dataset(set_id, data_transform, args.data, mode=args.dataset_mode)
         print("number of test samples: {}".format(len(val_dataset)))
+        workers = 0 if args.sar_tpt else args.workers
+        if args.sar_tpt and args.workers != 0:
+            print("=> SAR augmentation owns the model during transform; overriding workers to 0.")
         val_loader = torch.utils.data.DataLoader(
                     val_dataset,
                     batch_size=batchsize, shuffle=True,
-                    num_workers=args.workers, pin_memory=True)
+                    num_workers=workers, pin_memory=True)
             
         results[set_id] = test_time_adapt_eval(val_loader, model, model_state, optimizer, optim_state, scaler, args)
+        if args.sar_tpt and hasattr(data_transform, "stats"):
+            print("=> SAR augmentation stats [{}]: {}".format(set_id, data_transform.stats.as_dict()))
         del val_dataset, val_loader
         try:
             print("=> Acc. on testset [{}]: @1 {}/ @5 {}".format(set_id, results[set_id][0], results[set_id][1]))
@@ -334,5 +394,35 @@ if __name__ == '__main__':
     parser.add_argument('--cocoop', action='store_true', default=False, help="use cocoop's output as prompt initialization")
     parser.add_argument('--load', default=None, type=str, help='path to a pre-trained coop/cocoop')
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--sar_tpt', action='store_true', default=False,
+                        help='use SAR-TPT region-guided multi-view augmentation')
+    parser.add_argument('--anchor_path', default=None, type=str,
+                        help='path to stage-one text anchors; supports {set_id}, {dataset}, {arch} placeholders')
+    parser.add_argument('--mask_top_ratio', default=0.3, type=float,
+                        help='stage-two semantic mask top activation ratio')
+    parser.add_argument('--min_mask_area_ratio', default=0.01, type=float,
+                        help='minimum semantic mask area before fallback')
+    parser.add_argument('--mask_fallback', default='center', choices=['center', 'full', 'none'],
+                        help='semantic mask fallback policy')
+    parser.add_argument('--allow_non_vit_fallback', action='store_true', default=False,
+                        help='allow center/full fallback mask when the visual backbone is not ViT')
+    parser.add_argument('--tau_cov', default=0.6, type=float,
+                        help='minimum semantic mask coverage required for guided crops')
+    parser.add_argument('--max_crop_trials', default=20, type=int,
+                        help='maximum candidate crop resampling attempts per view')
+    parser.add_argument('--crop_scale_min', default=0.5, type=float,
+                        help='minimum RandomResizedCrop scale for SAR guided views')
+    parser.add_argument('--crop_scale_max', default=1.0, type=float,
+                        help='maximum RandomResizedCrop scale for SAR guided views')
+    parser.add_argument('--crop_ratio_min', default=3.0/4.0, type=float,
+                        help='minimum RandomResizedCrop aspect ratio for SAR guided views')
+    parser.add_argument('--crop_ratio_max', default=4.0/3.0, type=float,
+                        help='maximum RandomResizedCrop aspect ratio for SAR guided views')
+    parser.add_argument('--hflip_p', default=0.5, type=float,
+                        help='horizontal flip probability for SAR guided views')
+    parser.add_argument('--bbox_padding_ratio', default=0.15, type=float,
+                        help='padding ratio for semantic-mask bounding-box fallback')
+    parser.add_argument('--augmix_severity', default=1, type=int,
+                        help='AugMix severity for SAR guided views')
 
     main()
